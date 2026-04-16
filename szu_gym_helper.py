@@ -11,7 +11,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================= 核心配置区 =================
 # 建议在 README 中提示用户，只需在这里填写一次 Cookie
-YOUR_LATEST_COOKIE = "_WEU=; insert_cookie=; route=; MOD_AUTH_CAS=; JSESSIONID="
+YOUR_LATEST_COOKIE = "_WEU=cIUaUkJDXIcVcUq8P4pKLju1PlJE_AwJQGzR5u8uUzI6dk2ACPfZ0fS4zKIwKROSs0y0cJnnuQwEI1JqRXQ8rkvLUD69PukibNXb_kJLSwaSIiyGgnyXkD90l9ZbzON2Ooc2FWT1XpeFQT1B3guky5_mzkgfu19oqB*iHiTuDWfxMGpaLdzgS2bJ7JYBytFCmUZmALNhvrc.; insert_cookie=38189586; MOD_AUTH_CAS=MOD_AUTH_ST-8487453-tuskxCOqW92fxVYKqqu4-exRpmkciapserver4; asessionid=36f2514d-c010-4fc8-82c7-e519c396f0fd; amp.locale=undefined; JSESSIONID=Ax2WBKTcrnUICO9HrsRvgzcQkERAXIZl2sfjTOtYG5O8aaljU1go!1254479841; route=07389b9fd090f647166fb5e572add976"
 
 # API 接口地址
 LIST_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/sportVenue/getTimeList.do"

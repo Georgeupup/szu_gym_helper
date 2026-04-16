@@ -1,5 +1,5 @@
 
-# 🏸 深大体育馆自动捡漏器 (SZU Gym Helper)
+# 🏸 深大健身房自动捡漏器 (SZU Gym Helper)
 
 ![Python](https://img.shields.io/badge/Python-3.x-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
@@ -46,7 +46,7 @@ YOUR_LATEST_COOKIE = "_WEU=xxxxxx; MOD_AUTH_CAS=xxxxxx; JSESSIONID=xxxxxx"
 
 ### 5. 运行程序
 ```bash
-python sszu_gym_helper.py
+python szu_gym_helper.py
 ```
 运行后，点击“拉取场馆状态”，然后点击对应时间段的橙色（已满员）或蓝色（可预约）按钮，静候佳音即可！🎉
 
