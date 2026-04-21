@@ -10,8 +10,8 @@ import threading
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================= 核心配置区 =================
-# 建议在 README 中提示用户，只需在这里填写一次 Cookie
-YOUR_LATEST_COOKIE = "_WEU=cIUaUkJDXIcVcUq8P4pKLju1PlJE_AwJQGzR5u8uUzI6dk2ACPfZ0fS4zKIwKROSs0y0cJnnuQwEI1JqRXQ8rkvLUD69PukibNXb_kJLSwaSIiyGgnyXkD90l9ZbzON2Ooc2FWT1XpeFQT1B3guky5_mzkgfu19oqB*iHiTuDWfxMGpaLdzgS2bJ7JYBytFCmUZmALNhvrc.; insert_cookie=38189586; MOD_AUTH_CAS=MOD_AUTH_ST-8487453-tuskxCOqW92fxVYKqqu4-exRpmkciapserver4; asessionid=36f2514d-c010-4fc8-82c7-e519c396f0fd; amp.locale=undefined; JSESSIONID=Ax2WBKTcrnUICO9HrsRvgzcQkERAXIZl2sfjTOtYG5O8aaljU1go!1254479841; route=07389b9fd090f647166fb5e572add976"
+# 默认 Cookie，可在此处填入作为默认值，也可在界面上手动输入
+DEFAULT_COOKIE = ""
 
 # API 接口地址
 LIST_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/sportVenue/getTimeList.do"
@@ -24,21 +24,32 @@ HEADERS = {
     "Origin": "https://ehall.szu.edu.cn",
     "X-Requested-With": "XMLHttpRequest",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.6668.101 Safari/537.36",
-    "Cookie": YOUR_LATEST_COOKIE
+    "Cookie": DEFAULT_COOKIE
 }
+
 
 class SniperGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("深大体育馆自动捡漏器 v2.1")
-        self.root.geometry("620x600")
+        self.root.title("深大体育馆自动捡漏器 v2.2")
+        self.root.geometry("620x650")
 
         self.stop_event = threading.Event()
         self.is_running = False
 
+        # --- 顶部：Token/Cookie 输入区 ---
+        frame_token = tk.Frame(self.root)
+        frame_token.pack(pady=(15, 5))
+
+        tk.Label(frame_token, text="Cookie/Token:", font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
+
+        self.token_var = tk.StringVar(value=DEFAULT_COOKIE)
+        self.token_entry = tk.Entry(frame_token, textvariable=self.token_var, width=50, font=("Arial", 10))
+        self.token_entry.pack(side=tk.LEFT, padx=5)
+
         # --- 顶部：日期选择区 ---
         frame_date = tk.Frame(self.root)
-        frame_date.pack(pady=10)
+        frame_date.pack(pady=5)
 
         tk.Label(frame_date, text="预约日期:", font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
 
@@ -53,10 +64,12 @@ class SniperGUI:
         frame_ops = tk.Frame(self.root)
         frame_ops.pack(pady=5)
 
-        self.btn_fetch = tk.Button(frame_ops, text="🔍 拉取场馆状态", command=self.fetch_slots, bg="#4CAF50", fg="white", width=15)
+        self.btn_fetch = tk.Button(frame_ops, text="🔍 拉取场馆状态", command=self.fetch_slots, bg="#4CAF50", fg="white",
+                                   width=15)
         self.btn_fetch.pack(side=tk.LEFT, padx=10)
 
-        self.btn_stop = tk.Button(frame_ops, text="⏹ 停止当前捡漏", command=self.stop_sniping, bg="#F44336", fg="white", state=tk.DISABLED, width=15)
+        self.btn_stop = tk.Button(frame_ops, text="⏹ 停止当前捡漏", command=self.stop_sniping, bg="#F44336", fg="white",
+                                  state=tk.DISABLED, width=15)
         self.btn_stop.pack(side=tk.LEFT, padx=10)
 
         # --- 按钮容器 ---
@@ -66,28 +79,33 @@ class SniperGUI:
         # --- 日志输出区 ---
         self.log_text = tk.Text(self.root, height=18, width=75)
         self.log_text.pack(pady=10)
-        self.safe_log("💡 请先确认日期，点击 [拉取场馆状态]...")
+        self.safe_log("💡 请先确认 Cookie 和日期，点击 [拉取场馆状态]...")
 
     def safe_log(self, msg):
         def append_text():
             self.log_text.insert(tk.END, msg + "\n")
             self.log_text.see(tk.END)
+
         self.root.after(0, append_text)
 
     def fetch_slots(self):
         if self.is_running:
             return
 
-        # 每次刷新前，先从输入框获取最新日期
         target_date = self.date_var.get().strip()
+        current_token = self.token_var.get().strip()
+
+        if not current_token:
+            messagebox.showwarning("提示", "请先输入 Cookie/Token！")
+            return
 
         for widget in self.btn_frame.winfo_children():
             widget.destroy()
 
         payload = {"XQ": "1", "YYRQ": target_date, "YYLX": "2.0", "XMDM": "007"}
         try:
-            # 更新全局 Header 中的 Cookie (以防用户中途修改代码配置)
-            HEADERS["Cookie"] = YOUR_LATEST_COOKIE
+            # 动态更新全局 Header 中的 Cookie
+            HEADERS["Cookie"] = current_token
             res = requests.post(LIST_URL, headers=HEADERS, data=payload, verify=False, timeout=5)
             data_list = res.json()
 
@@ -123,6 +141,7 @@ class SniperGUI:
 
         # 锁定UI
         self.date_entry.config(state=tk.DISABLED)
+        self.token_entry.config(state=tk.DISABLED)
         self.btn_fetch.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         for child in self.btn_frame.winfo_children():
@@ -162,7 +181,8 @@ class SniperGUI:
                     if str(code) == "0" or "成功" in msg:
                         dhid = res_json.get("data", {}).get("DHID", "未知")
                         self.safe_log(f"🎉 成功！订单号: {dhid}")
-                        self.root.after(0, lambda: messagebox.showinfo("成功", f"抢到啦！\n日期: {target_date}\n时段: {time_slot}"))
+                        self.root.after(0, lambda: messagebox.showinfo("成功",
+                                                                       f"抢到啦！\n日期: {target_date}\n时段: {time_slot}"))
                         break
                     else:
                         self.safe_log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] #{attempts} -> {msg}")
@@ -177,12 +197,16 @@ class SniperGUI:
                 time.sleep(0.5)
 
         self.is_running = False
+
         def restore_ui():
             self.date_entry.config(state=tk.NORMAL)
+            self.token_entry.config(state=tk.NORMAL)
             self.btn_fetch.config(state=tk.NORMAL)
             self.btn_stop.config(state=tk.DISABLED)
             self.fetch_slots()
+
         self.root.after(0, restore_ui)
+
 
 if __name__ == "__main__":
     root = tk.Tk()
