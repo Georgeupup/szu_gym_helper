@@ -5,6 +5,7 @@ import urllib3
 import tkinter as tk
 from tkinter import messagebox
 import threading
+from pathlib import Path
 
 # 禁用 HTTPS 证书警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -16,6 +17,13 @@ DEFAULT_COOKIE = ""
 # API 接口地址
 LIST_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/sportVenue/getTimeList.do"
 POST_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/sportVenue/insertVenueBookingInfo.do"
+SPORT_VENUE_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/index.do#/sportVenue"
+MY_BOOKING_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/index.do#/myBooking"
+BROWSER_COOKIE_DOMAIN = "ehall.szu.edu.cn"
+BROWSER_COOKIE_PATH = "/qljfwapp/sys/lwSzuCgyy/sportVenue/getTimeList.do"
+AUTH_COOKIE_NAMES = ("MOD_AUTH_CAS", "JSESSIONID")
+PLAYWRIGHT_PROFILE_DIR = Path(__file__).with_name(".playwright_profile")
+COOKIE_WAIT_SECONDS = 180
 
 # 基础请求头
 HEADERS = {
@@ -28,58 +36,306 @@ HEADERS = {
 }
 
 
+def build_cookie_header(cookies):
+    matched_cookies = []
+    for cookie in cookies:
+        domain = cookie.get("domain", "").lstrip(".")
+        path = cookie.get("path") or "/"
+        domain_match = (
+            domain == BROWSER_COOKIE_DOMAIN
+            or BROWSER_COOKIE_DOMAIN.endswith("." + domain)
+            or domain.endswith(".szu.edu.cn")
+        )
+        path_match = BROWSER_COOKIE_PATH.startswith(path)
+        if domain_match and path_match:
+            matched_cookies.append(cookie)
+
+    matched_cookies.sort(key=lambda item: len(item.get("path") or "/"), reverse=True)
+    return "; ".join(f"{cookie['name']}={cookie['value']}" for cookie in matched_cookies)
+
+
+def parse_cookie_header(cookie_header):
+    cookies = []
+    for item in cookie_header.split(";"):
+        if "=" not in item:
+            continue
+        name, value = item.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if name:
+            cookies.append({
+                "name": name,
+                "value": value,
+                "domain": BROWSER_COOKIE_DOMAIN,
+                "path": "/",
+                "secure": True,
+            })
+    return cookies
+
+
+def launch_persistent_browser(playwright):
+    launch_options = [
+        ("Edge", {"channel": "msedge"}),
+        ("Chrome", {"channel": "chrome"}),
+        ("Chromium", {}),
+    ]
+    errors = []
+
+    for browser_name, browser_options in launch_options:
+        try:
+            context = playwright.chromium.launch_persistent_context(
+                str(PLAYWRIGHT_PROFILE_DIR),
+                headless=False,
+                viewport={"width": 1280, "height": 900},
+                args=["--start-maximized"],
+                **browser_options
+            )
+            return browser_name, context
+        except Exception as exc:
+            errors.append(f"{browser_name}: {exc}")
+
+    raise RuntimeError("\n".join(errors))
+
+
+def load_cookie_from_playwright():
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖 playwright，请先运行：pip install playwright") from exc
+
+    PLAYWRIGHT_PROFILE_DIR.mkdir(exist_ok=True)
+
+    with sync_playwright() as p:
+        context = None
+        try:
+            browser_name, context = launch_persistent_browser(p)
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(SPORT_VENUE_URL, wait_until="domcontentloaded", timeout=60000)
+
+            deadline = time.time() + COOKIE_WAIT_SECONDS
+            while time.time() < deadline:
+                cookie_text = build_cookie_header(context.cookies(LIST_URL))
+                if cookie_text and any(name in cookie_text for name in AUTH_COOKIE_NAMES):
+                    return browser_name, cookie_text
+                page.wait_for_timeout(1000)
+
+            raise RuntimeError("等待登录超时，请在打开的浏览器中完成登录并进入体育场馆预约页面")
+        except Exception as exc:
+            raise RuntimeError(f"自动获取 Cookie 失败。\n{exc}") from exc
+        finally:
+            if context is not None:
+                context.close()
+
+
+def open_my_booking_page(cookie_header, opened_callback=None):
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("缺少依赖 playwright，请先运行：pip install playwright==1.40.0") from exc
+
+    cookies = parse_cookie_header(cookie_header)
+    if not cookies:
+        raise RuntimeError("当前 Cookie 为空，无法打开支付页面")
+
+    PLAYWRIGHT_PROFILE_DIR.mkdir(exist_ok=True)
+    with sync_playwright() as p:
+        browser_name, context = launch_persistent_browser(p)
+        try:
+            context.add_cookies(cookies)
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(MY_BOOKING_URL, wait_until="domcontentloaded", timeout=60000)
+            if opened_callback is not None:
+                opened_callback(browser_name)
+            while context.pages:
+                try:
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    break
+            return browser_name
+        finally:
+            context.close()
+
+
 class SniperGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("深大体育馆自动捡漏器 v2.2")
-        self.root.geometry("620x650")
+        self.root.title("深大体育馆自动捡漏器 v2.3")
+        self.root.geometry("760x720")
+        self.root.minsize(720, 650)
+        self.root.configure(bg="#F4F7FB")
 
         self.stop_event = threading.Event()
         self.is_running = False
 
-        # --- 顶部：Token/Cookie 输入区 ---
-        frame_token = tk.Frame(self.root)
-        frame_token.pack(pady=(15, 5))
+        self.colors = {
+            "bg": "#F4F7FB",
+            "panel": "#FFFFFF",
+            "border": "#DCE3EC",
+            "text": "#1F2937",
+            "muted": "#6B7280",
+            "primary": "#2563EB",
+            "success": "#16A34A",
+            "danger": "#DC2626",
+            "warning": "#F59E0B",
+            "disabled": "#E5E7EB",
+        }
 
-        tk.Label(frame_token, text="Cookie/Token:", font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
+        header = tk.Frame(self.root, bg=self.colors["primary"], height=86)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        tk.Label(
+            header,
+            text="深大体育馆自动捡漏器",
+            bg=self.colors["primary"],
+            fg="white",
+            font=("Microsoft YaHei UI", 20, "bold"),
+        ).pack(anchor=tk.W, padx=24, pady=(16, 0))
+        tk.Label(
+            header,
+            text="自动获取 Cookie，拉取场馆状态，选中时段后后台持续捡漏",
+            bg=self.colors["primary"],
+            fg="#DBEAFE",
+            font=("Microsoft YaHei UI", 10),
+        ).pack(anchor=tk.W, padx=26, pady=(2, 0))
+
+        content = tk.Frame(self.root, bg=self.colors["bg"])
+        content.pack(fill=tk.BOTH, expand=True, padx=18, pady=16)
+
+        # --- 身份认证区 ---
+        frame_token = self.create_panel(content, "身份认证")
+        frame_token.pack(fill=tk.X, pady=(0, 12))
+
+        tk.Label(
+            frame_token,
+            text="Cookie / Token",
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side=tk.LEFT, padx=(14, 8), pady=14)
 
         self.token_var = tk.StringVar(value=DEFAULT_COOKIE)
-        self.token_entry = tk.Entry(frame_token, textvariable=self.token_var, width=50, font=("Arial", 10))
-        self.token_entry.pack(side=tk.LEFT, padx=5)
+        self.token_entry = tk.Entry(
+            frame_token,
+            textvariable=self.token_var,
+            width=58,
+            relief=tk.FLAT,
+            bg="#F9FAFB",
+            fg=self.colors["text"],
+            insertbackground=self.colors["text"],
+            font=("Consolas", 10),
+        )
+        self.token_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10), ipady=7)
+        self.btn_auto_cookie = self.make_button(
+            frame_token, "自动获取", self.auto_fill_cookie, self.colors["primary"], width=10
+        )
+        self.btn_auto_cookie.pack(side=tk.LEFT, padx=(0, 14), pady=10)
 
-        # --- 顶部：日期选择区 ---
-        frame_date = tk.Frame(self.root)
-        frame_date.pack(pady=5)
+        # --- 预约操作区 ---
+        frame_ops_outer = self.create_panel(content, "预约操作")
+        frame_ops_outer.pack(fill=tk.X, pady=(0, 12))
 
-        tk.Label(frame_date, text="预约日期:", font=("Arial", 11)).pack(side=tk.LEFT, padx=5)
+        frame_date = tk.Frame(frame_ops_outer, bg=self.colors["panel"])
+        frame_date.pack(fill=tk.X, padx=14, pady=(12, 8))
 
-        # 默认显示今日日期
+        tk.Label(
+            frame_date,
+            text="预约日期",
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
         self.date_var = tk.StringVar(value=datetime.date.today().strftime("%Y-%m-%d"))
-        self.date_entry = tk.Entry(frame_date, textvariable=self.date_var, width=12, font=("Arial", 11))
-        self.date_entry.pack(side=tk.LEFT, padx=5)
+        self.date_entry = tk.Entry(
+            frame_date,
+            textvariable=self.date_var,
+            width=14,
+            relief=tk.FLAT,
+            bg="#F9FAFB",
+            fg=self.colors["text"],
+            justify=tk.CENTER,
+            font=("Consolas", 11),
+        )
+        self.date_entry.pack(side=tk.LEFT, ipady=7)
+        tk.Label(
+            frame_date,
+            text="格式 YYYY-MM-DD",
+            bg=self.colors["panel"],
+            fg=self.colors["muted"],
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side=tk.LEFT, padx=10)
 
-        tk.Label(frame_date, text="(格式: YYYY-MM-DD)", fg="gray").pack(side=tk.LEFT)
+        frame_ops = tk.Frame(frame_ops_outer, bg=self.colors["panel"])
+        frame_ops.pack(fill=tk.X, padx=14, pady=(0, 14))
 
-        # --- 操作按钮区 ---
-        frame_ops = tk.Frame(self.root)
-        frame_ops.pack(pady=5)
+        self.btn_fetch = self.make_button(frame_ops, "拉取场馆状态", self.fetch_slots, self.colors["success"], width=16)
+        self.btn_fetch.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.btn_fetch = tk.Button(frame_ops, text="🔍 拉取场馆状态", command=self.fetch_slots, bg="#4CAF50", fg="white",
-                                   width=15)
-        self.btn_fetch.pack(side=tk.LEFT, padx=10)
+        self.btn_stop = self.make_button(
+            frame_ops, "停止当前捡漏", self.stop_sniping, self.colors["danger"], width=16, state=tk.DISABLED
+        )
+        self.btn_stop.pack(side=tk.LEFT)
 
-        self.btn_stop = tk.Button(frame_ops, text="⏹ 停止当前捡漏", command=self.stop_sniping, bg="#F44336", fg="white",
-                                  state=tk.DISABLED, width=15)
-        self.btn_stop.pack(side=tk.LEFT, padx=10)
+        # --- 时段区 ---
+        slots_panel = self.create_panel(content, "场馆时段")
+        slots_panel.pack(fill=tk.BOTH, expand=True, pady=(0, 12))
+        self.btn_frame = tk.Frame(slots_panel, bg=self.colors["panel"])
+        self.btn_frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
 
-        # --- 按钮容器 ---
-        self.btn_frame = tk.Frame(self.root)
-        self.btn_frame.pack(pady=10)
+        self.empty_slot_label = tk.Label(
+            self.btn_frame,
+            text="点击“拉取场馆状态”后会在这里显示可预约时段",
+            bg=self.colors["panel"],
+            fg=self.colors["muted"],
+            font=("Microsoft YaHei UI", 11),
+        )
+        self.empty_slot_label.pack(expand=True)
 
         # --- 日志输出区 ---
-        self.log_text = tk.Text(self.root, height=18, width=75)
-        self.log_text.pack(pady=10)
-        self.safe_log("💡 请先确认 Cookie 和日期，点击 [拉取场馆状态]...")
+        log_panel = self.create_panel(content, "运行日志")
+        log_panel.pack(fill=tk.BOTH)
+        self.log_text = tk.Text(
+            log_panel,
+            height=10,
+            relief=tk.FLAT,
+            bg="#111827",
+            fg="#D1D5DB",
+            insertbackground="#D1D5DB",
+            font=("Consolas", 10),
+        )
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+        self.safe_log("请先确认 Cookie 和日期，点击 [拉取场馆状态]。")
+
+    def create_panel(self, parent, title):
+        wrapper = tk.Frame(parent, bg=self.colors["panel"], highlightthickness=1, highlightbackground=self.colors["border"])
+        title_label = tk.Label(
+            wrapper,
+            text=title,
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            font=("Microsoft YaHei UI", 11, "bold"),
+        )
+        title_label.pack(anchor=tk.W, padx=14, pady=(10, 0))
+        return wrapper
+
+    def make_button(self, parent, text, command, color, width=12, state=tk.NORMAL):
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            width=width,
+            state=state,
+            bg=color,
+            fg="white",
+            activebackground=color,
+            activeforeground="white",
+            disabledforeground="#9CA3AF",
+            relief=tk.FLAT,
+            cursor="hand2",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            padx=10,
+            pady=7,
+        )
 
     def safe_log(self, msg):
         def append_text():
@@ -87,6 +343,54 @@ class SniperGUI:
             self.log_text.see(tk.END)
 
         self.root.after(0, append_text)
+
+    def auto_fill_cookie(self):
+        if self.is_running:
+            return
+
+        self.btn_auto_cookie.config(state=tk.DISABLED)
+        self.safe_log("正在打开专用浏览器，请在弹出的窗口中登录并进入体育场馆预约页面...")
+
+        t = threading.Thread(target=self.auto_fill_cookie_task)
+        t.daemon = True
+        t.start()
+
+    def auto_fill_cookie_task(self):
+        try:
+            browser_name, cookie_text = load_cookie_from_playwright()
+
+            def apply_cookie():
+                self.token_var.set(cookie_text)
+                self.btn_auto_cookie.config(state=tk.NORMAL)
+                self.safe_log(f"已通过 Playwright/{browser_name} 获取 Cookie，长度：{len(cookie_text)}")
+                messagebox.showinfo("成功", f"已通过 Playwright/{browser_name} 自动获取 Cookie。")
+
+            self.root.after(0, apply_cookie)
+        except Exception as exc:
+            error_msg = str(exc)
+
+            def show_error():
+                self.btn_auto_cookie.config(state=tk.NORMAL)
+                self.safe_log(f"自动获取 Cookie 失败：{error_msg}")
+                messagebox.showerror("自动获取失败", error_msg)
+
+            self.root.after(0, show_error)
+
+    def open_payment_page(self, cookie_header):
+        self.safe_log("正在打开我的预约页面，请稍后在浏览器中完成支付...")
+        t = threading.Thread(target=self.open_payment_page_task, args=(cookie_header,))
+        t.daemon = True
+        t.start()
+
+    def open_payment_page_task(self, cookie_header):
+        try:
+            def opened(browser_name):
+                self.safe_log(f"已通过 Playwright/{browser_name} 打开我的预约页面，请手动确认并支付。")
+
+            open_my_booking_page(cookie_header, opened_callback=opened)
+            self.safe_log("我的预约页面已关闭。")
+        except Exception as exc:
+            self.safe_log(f"打开我的预约页面失败：{exc}")
 
     def fetch_slots(self):
         if self.is_running:
@@ -109,23 +413,61 @@ class SniperGUI:
             res = requests.post(LIST_URL, headers=HEADERS, data=payload, verify=False, timeout=5)
             data_list = res.json()
 
+            if not data_list:
+                tk.Label(
+                    self.btn_frame,
+                    text="当前日期没有返回可展示的时段",
+                    bg=self.colors["panel"],
+                    fg=self.colors["muted"],
+                    font=("Microsoft YaHei UI", 11),
+                ).pack(expand=True)
+                self.safe_log(f"日期 {target_date} 暂无可展示时段。")
+                return
+
             row, col = 0, 0
             for item in data_list:
                 time_code = item.get("CODE")
                 status_text = item.get("text")
-                btn_text = f"{time_code}\n[{status_text}]"
+                btn_text = f"{time_code}\n{status_text}"
 
                 if status_text == "已过期":
-                    btn = tk.Button(self.btn_frame, text=btn_text, width=15, height=2, state=tk.DISABLED)
+                    btn = tk.Button(
+                        self.btn_frame,
+                        text=btn_text,
+                        width=16,
+                        height=2,
+                        state=tk.DISABLED,
+                        bg=self.colors["disabled"],
+                        disabledforeground=self.colors["muted"],
+                        relief=tk.FLAT,
+                        font=("Microsoft YaHei UI", 10),
+                    )
                 else:
-                    bg_color = "#FF9800" if status_text == "已满员" else "#2196F3"
-                    btn = tk.Button(self.btn_frame, text=btn_text, width=15, height=2, bg=bg_color, fg="white",
-                                    command=lambda t=time_code: self.start_thread(t))
-                btn.grid(row=row, column=col, padx=5, pady=5)
+                    bg_color = self.colors["warning"] if status_text == "已满员" else self.colors["primary"]
+                    btn = tk.Button(
+                        self.btn_frame,
+                        text=btn_text,
+                        width=16,
+                        height=2,
+                        bg=bg_color,
+                        fg="white",
+                        activebackground=bg_color,
+                        activeforeground="white",
+                        relief=tk.FLAT,
+                        cursor="hand2",
+                        font=("Microsoft YaHei UI", 10, "bold"),
+                        command=lambda t=time_code: self.start_thread(t)
+                    )
+                btn.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
                 col += 1
-                if col > 3: col = 0; row += 1
+                if col > 3:
+                    col = 0
+                    row += 1
 
-            self.safe_log(f"✅ 日期 {target_date} 状态刷新成功！")
+            for grid_col in range(4):
+                self.btn_frame.grid_columnconfigure(grid_col, weight=1)
+
+            self.safe_log(f"日期 {target_date} 状态刷新成功。")
         except Exception as e:
             messagebox.showerror("错误", f"拉取失败，请检查日期格式或Cookie\n{e}")
 
@@ -142,6 +484,7 @@ class SniperGUI:
         # 锁定UI
         self.date_entry.config(state=tk.DISABLED)
         self.token_entry.config(state=tk.DISABLED)
+        self.btn_auto_cookie.config(state=tk.DISABLED)
         self.btn_fetch.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         for child in self.btn_frame.winfo_children():
@@ -168,7 +511,7 @@ class SniperGUI:
 
         session = requests.Session()
         session.headers.update(HEADERS)
-        self.safe_log(f"🚀 锁定: {target_date} {time_slot}")
+        self.safe_log(f"锁定时段：{target_date} {time_slot}")
 
         attempts = 0
         while not self.stop_event.is_set():
@@ -180,17 +523,18 @@ class SniperGUI:
                     code, msg = res_json.get("code"), res_json.get("msg", "未知")
                     if str(code) == "0" or "成功" in msg:
                         dhid = res_json.get("data", {}).get("DHID", "未知")
-                        self.safe_log(f"🎉 成功！订单号: {dhid}")
+                        self.safe_log(f"预约成功，订单号：{dhid}")
+                        self.open_payment_page(session.headers.get("Cookie", ""))
                         self.root.after(0, lambda: messagebox.showinfo("成功",
                                                                        f"抢到啦！\n日期: {target_date}\n时段: {time_slot}"))
                         break
                     else:
                         self.safe_log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] #{attempts} -> {msg}")
                 except ValueError:
-                    self.safe_log("❌ 拦截: Cookie可能失效")
+                    self.safe_log("请求被拦截：Cookie 可能失效")
                     break
             except Exception as e:
-                self.safe_log(f"❌ 网络异常: {e}")
+                self.safe_log(f"网络异常：{e}")
 
             for _ in range(5):
                 if self.stop_event.is_set(): break
@@ -201,6 +545,7 @@ class SniperGUI:
         def restore_ui():
             self.date_entry.config(state=tk.NORMAL)
             self.token_entry.config(state=tk.NORMAL)
+            self.btn_auto_cookie.config(state=tk.NORMAL)
             self.btn_fetch.config(state=tk.NORMAL)
             self.btn_stop.config(state=tk.DISABLED)
             self.fetch_slots()
