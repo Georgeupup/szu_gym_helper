@@ -35,7 +35,10 @@ playwright==1.40.0
 程序会优先调用系统已安装的 Edge 或 Chrome，因此通常不需要额外执行 `playwright install`。
 
 ## 使用
+### 方法一：
+Releases页面直接下载.exe文件打开运行
 
+### 方法二：
 ```bash
 python szu_gym_helper.py
 ```
