@@ -1,6 +1,8 @@
 import requests
 import time
 import datetime
+import json
+import re
 import urllib3
 import tkinter as tk
 from tkinter import messagebox
@@ -20,6 +22,7 @@ DEFAULT_STUDENT_NAME = ""
 LIST_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/sportVenue/getTimeList.do"
 POST_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/sportVenue/insertVenueBookingInfo.do"
 SPORT_VENUE_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/index.do#/sportVenue"
+APP_INDEX_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/index.do"
 MY_BOOKING_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/index.do#/myBooking"
 BROWSER_COOKIE_DOMAIN = "ehall.szu.edu.cn"
 BROWSER_COOKIE_PATH = "/qljfwapp/sys/lwSzuCgyy/sportVenue/getTimeList.do"
@@ -75,6 +78,52 @@ def parse_cookie_header(cookie_header):
     return cookies
 
 
+def extract_user_info_from_html(html):
+    match = re.search(r"USER_INFO\s*=\s*(\{.*?\})\s*;", html, re.DOTALL)
+    user_info = {}
+    if match:
+        try:
+            user_info = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            user_info = {}
+
+    info_values = user_info.get("info") or []
+    user_id = str(
+        user_info.get("id")
+        or (info_values[0] if len(info_values) > 0 else "")
+        or ""
+    ).strip()
+    user_name = str(
+        user_info.get("name")
+        or user_info.get("userName")
+        or (info_values[1] if len(info_values) > 1 else "")
+        or ""
+    ).strip()
+
+    if not user_id:
+        id_match = re.search(r"USERID\s*=\s*['\"]([^'\"]+)['\"]", html)
+        if id_match:
+            user_id = id_match.group(1).strip()
+
+    if not user_id or not user_name:
+        raise RuntimeError("场馆页面未返回当前登录人的学号/工号和姓名")
+    return user_id, user_name
+
+
+def fetch_logged_in_user(cookie_header):
+    headers = {**HEADERS, "Cookie": cookie_header}
+    response = requests.get(
+        APP_INDEX_URL,
+        headers=headers,
+        verify=False,
+        timeout=8,
+        allow_redirects=True,
+    )
+    if "authserver.szu.edu.cn" in response.url:
+        raise RuntimeError("Cookie 已失效，请重新点击“自动获取”并登录")
+    return extract_user_info_from_html(response.text)
+
+
 def launch_persistent_browser(playwright):
     launch_options = [
         ("Edge", {"channel": "msedge"}),
@@ -118,7 +167,19 @@ def load_cookie_from_playwright():
             page.goto(SPORT_VENUE_URL, wait_until="domcontentloaded", timeout=60000)
 
             deadline = time.time() + COOKIE_WAIT_SECONDS
+            login_account = ""
             while time.time() < deadline:
+                if "authserver.szu.edu.cn" in page.url:
+                    try:
+                        account_input = page.locator(
+                            "input[name='username'], input#username"
+                        ).first
+                        current_account = account_input.input_value(timeout=200).strip()
+                        if current_account:
+                            login_account = current_account
+                    except Exception:
+                        pass
+
                 cookies = context.cookies(LIST_URL)
                 cookie_text = build_cookie_header(cookies)
                 cookie_names = {cookie.get("name") for cookie in cookies}
@@ -130,7 +191,24 @@ def load_cookie_from_playwright():
                     and REQUIRED_AUTH_COOKIE_NAME in cookie_names
                     and is_venue_page
                 ):
-                    return browser_name, cookie_text
+                    try:
+                        user_data = page.evaluate(
+                            """() => {
+                                const info = window.USER_INFO || {};
+                                const values = Array.isArray(info.info) ? info.info : [];
+                                return {
+                                    id: String(info.id || window.USERID || values[0] || ''),
+                                    name: String(info.name || info.userName || values[1] || '')
+                                };
+                            }"""
+                        )
+                        user_id = user_data.get("id", "").strip()
+                        user_name = user_data.get("name", "").strip()
+                        if user_id and user_name:
+                            return browser_name, cookie_text, user_id, user_name, login_account
+                    except Exception:
+                        # 登录跳转期间执行上下文可能被刷新，等待下一轮即可。
+                        pass
                 page.wait_for_timeout(1000)
 
             raise RuntimeError("等待登录超时，请在打开的浏览器中完成登录并进入体育场馆预约页面")
@@ -173,13 +251,16 @@ def open_my_booking_page(cookie_header, opened_callback=None):
 class SniperGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("深大体育馆自动捡漏器 v2.4.0")
+        self.root.title("深大体育馆自动捡漏器 v2.4.1")
         self.root.geometry("760x720")
         self.root.minsize(720, 650)
         self.root.configure(bg="#F4F7FB")
 
         self.stop_event = threading.Event()
         self.is_running = False
+        self.verified_cookie = ""
+        self.logged_in_user = None
+        self.login_account = ""
 
         self.colors = {
             "bg": "#F4F7FB",
@@ -245,7 +326,7 @@ class SniperGUI:
         self.btn_auto_cookie.pack(side=tk.LEFT, padx=(0, 14), pady=10)
 
         # --- 预约人信息区 ---
-        frame_user = self.create_panel(content, "预约人信息")
+        frame_user = self.create_panel(content, "当前登录人（自动读取）")
         frame_user.pack(fill=tk.X, pady=(0, 12))
 
         user_fields = tk.Frame(frame_user, bg=self.colors["panel"])
@@ -267,7 +348,9 @@ class SniperGUI:
             relief=tk.FLAT,
             bg="#F9FAFB",
             fg=self.colors["text"],
+            readonlybackground="#F3F4F6",
             font=("Consolas", 10),
+            state="readonly",
         )
         self.student_id_entry.pack(side=tk.LEFT, padx=(0, 18), ipady=7)
 
@@ -287,7 +370,9 @@ class SniperGUI:
             relief=tk.FLAT,
             bg="#F9FAFB",
             fg=self.colors["text"],
+            readonlybackground="#F3F4F6",
             font=("Microsoft YaHei UI", 10),
+            state="readonly",
         )
         self.student_name_entry.pack(side=tk.LEFT, ipady=7)
 
@@ -418,13 +503,25 @@ class SniperGUI:
 
     def auto_fill_cookie_task(self):
         try:
-            browser_name, cookie_text = load_cookie_from_playwright()
+            browser_name, cookie_text, user_id, user_name, login_account = load_cookie_from_playwright()
 
             def apply_cookie():
                 self.token_var.set(cookie_text)
+                self.student_id_var.set(user_id)
+                self.student_name_var.set(user_name)
+                self.verified_cookie = cookie_text
+                self.logged_in_user = (user_id, user_name)
+                self.login_account = login_account
                 self.btn_auto_cookie.config(state=tk.NORMAL)
                 self.safe_log(f"已通过 Playwright/{browser_name} 获取 Cookie，长度：{len(cookie_text)}")
-                messagebox.showinfo("成功", f"已通过 Playwright/{browser_name} 自动获取 Cookie。")
+                account_text = f"，统一认证账号：{login_account}" if login_account else ""
+                self.safe_log(f"当前登录人：{user_name}（{user_id}）{account_text}")
+                messagebox.showinfo(
+                    "成功",
+                    f"已获取 Cookie 和登录人信息。\n\n"
+                    f"场馆系统预约人：{user_name}（{user_id}）"
+                    + (f"\n统一认证账号：{login_account}" if login_account else ""),
+                )
 
             self.root.after(0, apply_cookie)
         except Exception as exc:
@@ -469,6 +566,12 @@ class SniperGUI:
 
         payload = {"XQ": "1", "YYRQ": target_date, "YYLX": "2.0", "XMDM": "007"}
         try:
+            user_id, user_name = fetch_logged_in_user(current_token)
+            self.student_id_var.set(user_id)
+            self.student_name_var.set(user_name)
+            self.verified_cookie = current_token
+            self.logged_in_user = (user_id, user_name)
+            self.safe_log(f"已核对当前登录人：{user_name}（{user_id}）")
             request_headers = {**HEADERS, "Cookie": current_token}
             res = requests.post(LIST_URL, headers=request_headers, data=payload, verify=False, timeout=5)
             data_list = res.json()
@@ -546,8 +649,15 @@ class SniperGUI:
         if not current_token:
             messagebox.showwarning("提示", "请先输入 Cookie/Token！")
             return
-        if not student_id or not student_name:
-            messagebox.showwarning("提示", "请填写当前登录账号的学号/工号和姓名！")
+        if (
+            not self.logged_in_user
+            or self.verified_cookie != current_token
+            or self.logged_in_user != (student_id, student_name)
+        ):
+            messagebox.showwarning(
+                "提示",
+                "尚未核对当前 Cookie 的登录人，请先点击“拉取场馆状态”！",
+            )
             return
 
         self.is_running = True
@@ -587,7 +697,11 @@ class SniperGUI:
 
         session = requests.Session()
         session.headers.update({**HEADERS, "Cookie": current_token})
-        self.safe_log(f"锁定时段：{target_date} {time_slot}，预约人：{student_name}（{student_id}）")
+        self.safe_log(f"锁定时段：{target_date} {time_slot}")
+        self.safe_log(
+            f"身份核对：提交预约人={student_name}（{student_id}），"
+            f"Cookie登录人={self.logged_in_user[1]}（{self.logged_in_user[0]}）"
+        )
 
         attempts = 0
         while not self.stop_event.is_set():
@@ -607,13 +721,27 @@ class SniperGUI:
                     else:
                         self.safe_log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] #{attempts} -> {msg}")
                         if "预约人学工号不是当前登录人" in msg:
-                            self.safe_log("身份不匹配，已停止预约。请重新点击“自动获取”，登录预约人本人的账号。")
+                            identity_details = (
+                                f"本次提交预约人：{student_name}（{student_id}）"
+                            )
+                            try:
+                                actual_id, actual_name = fetch_logged_in_user(current_token)
+                                identity_details += (
+                                    f"\nCookie 登录人：{actual_name}（{actual_id}）"
+                                )
+                                self.safe_log(
+                                    f"再次读取服务器登录人：{actual_name}（{actual_id}）；"
+                                    f"本次提交预约人：{student_name}（{student_id}）"
+                                )
+                            except Exception as identity_exc:
+                                identity_details += f"\nCookie 登录人读取失败：{identity_exc}"
+                                self.safe_log(f"重新读取登录人失败：{identity_exc}")
+                            self.safe_log("身份不匹配，已停止预约，请查看上面的双方身份信息。")
                             self.root.after(
                                 0,
-                                lambda: messagebox.showerror(
+                                lambda details=identity_details: messagebox.showerror(
                                     "登录身份不匹配",
-                                    "当前 Cookie 不属于填写的预约人。\n\n"
-                                    "请点击“自动获取”，在弹出的登录页中登录预约人本人的账号。",
+                                    "服务器拒绝了当前身份组合。\n\n" + details,
                                 ),
                             )
                             break
@@ -632,8 +760,8 @@ class SniperGUI:
         def restore_ui():
             self.date_entry.config(state=tk.NORMAL)
             self.token_entry.config(state=tk.NORMAL)
-            self.student_id_entry.config(state=tk.NORMAL)
-            self.student_name_entry.config(state=tk.NORMAL)
+            self.student_id_entry.config(state="readonly")
+            self.student_name_entry.config(state="readonly")
             self.btn_auto_cookie.config(state=tk.NORMAL)
             self.btn_fetch.config(state=tk.NORMAL)
             self.btn_stop.config(state=tk.DISABLED)
