@@ -13,6 +13,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ================= 核心配置区 =================
 # 默认 Cookie，可在此处填入作为默认值，也可在界面上手动输入
 DEFAULT_COOKIE = ""
+DEFAULT_STUDENT_ID = ""
+DEFAULT_STUDENT_NAME = ""
 
 # API 接口地址
 LIST_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/sportVenue/getTimeList.do"
@@ -21,7 +23,7 @@ SPORT_VENUE_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/index.do#/spo
 MY_BOOKING_URL = "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/index.do#/myBooking"
 BROWSER_COOKIE_DOMAIN = "ehall.szu.edu.cn"
 BROWSER_COOKIE_PATH = "/qljfwapp/sys/lwSzuCgyy/sportVenue/getTimeList.do"
-AUTH_COOKIE_NAMES = ("MOD_AUTH_CAS", "JSESSIONID")
+REQUIRED_AUTH_COOKIE_NAME = "MOD_AUTH_CAS"
 PLAYWRIGHT_PROFILE_DIR = Path(__file__).with_name(".playwright_profile")
 COOKIE_WAIT_SECONDS = 180
 
@@ -109,13 +111,25 @@ def load_cookie_from_playwright():
         context = None
         try:
             browser_name, context = launch_persistent_browser(p)
+            # 专用浏览器会保留上一次的登录态。先全部清除，避免程序在用户
+            # 切换账号前就把旧账号的认证 Cookie 当作新 Cookie 返回。
+            context.clear_cookies()
             page = context.pages[0] if context.pages else context.new_page()
             page.goto(SPORT_VENUE_URL, wait_until="domcontentloaded", timeout=60000)
 
             deadline = time.time() + COOKIE_WAIT_SECONDS
             while time.time() < deadline:
-                cookie_text = build_cookie_header(context.cookies(LIST_URL))
-                if cookie_text and any(name in cookie_text for name in AUTH_COOKIE_NAMES):
+                cookies = context.cookies(LIST_URL)
+                cookie_text = build_cookie_header(cookies)
+                cookie_names = {cookie.get("name") for cookie in cookies}
+                is_venue_page = page.url.startswith(
+                    "https://ehall.szu.edu.cn/qljfwapp/sys/lwSzuCgyy/"
+                )
+                if (
+                    cookie_text
+                    and REQUIRED_AUTH_COOKIE_NAME in cookie_names
+                    and is_venue_page
+                ):
                     return browser_name, cookie_text
                 page.wait_for_timeout(1000)
 
@@ -159,7 +173,7 @@ def open_my_booking_page(cookie_header, opened_callback=None):
 class SniperGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("深大体育馆自动捡漏器 v2.3")
+        self.root.title("深大体育馆自动捡漏器 v2.4.0")
         self.root.geometry("760x720")
         self.root.minsize(720, 650)
         self.root.configure(bg="#F4F7FB")
@@ -229,6 +243,53 @@ class SniperGUI:
             frame_token, "自动获取", self.auto_fill_cookie, self.colors["primary"], width=10
         )
         self.btn_auto_cookie.pack(side=tk.LEFT, padx=(0, 14), pady=10)
+
+        # --- 预约人信息区 ---
+        frame_user = self.create_panel(content, "预约人信息")
+        frame_user.pack(fill=tk.X, pady=(0, 12))
+
+        user_fields = tk.Frame(frame_user, bg=self.colors["panel"])
+        user_fields.pack(fill=tk.X, padx=14, pady=(10, 14))
+
+        tk.Label(
+            user_fields,
+            text="学号 / 工号",
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.student_id_var = tk.StringVar(value=DEFAULT_STUDENT_ID)
+        self.student_id_entry = tk.Entry(
+            user_fields,
+            textvariable=self.student_id_var,
+            width=18,
+            relief=tk.FLAT,
+            bg="#F9FAFB",
+            fg=self.colors["text"],
+            font=("Consolas", 10),
+        )
+        self.student_id_entry.pack(side=tk.LEFT, padx=(0, 18), ipady=7)
+
+        tk.Label(
+            user_fields,
+            text="姓名",
+            bg=self.colors["panel"],
+            fg=self.colors["text"],
+            font=("Microsoft YaHei UI", 10, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        self.student_name_var = tk.StringVar(value=DEFAULT_STUDENT_NAME)
+        self.student_name_entry = tk.Entry(
+            user_fields,
+            textvariable=self.student_name_var,
+            width=16,
+            relief=tk.FLAT,
+            bg="#F9FAFB",
+            fg=self.colors["text"],
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.student_name_entry.pack(side=tk.LEFT, ipady=7)
 
         # --- 预约操作区 ---
         frame_ops_outer = self.create_panel(content, "预约操作")
@@ -408,9 +469,8 @@ class SniperGUI:
 
         payload = {"XQ": "1", "YYRQ": target_date, "YYLX": "2.0", "XMDM": "007"}
         try:
-            # 动态更新全局 Header 中的 Cookie
-            HEADERS["Cookie"] = current_token
-            res = requests.post(LIST_URL, headers=HEADERS, data=payload, verify=False, timeout=5)
+            request_headers = {**HEADERS, "Cookie": current_token}
+            res = requests.post(LIST_URL, headers=request_headers, data=payload, verify=False, timeout=5)
             data_list = res.json()
 
             if not data_list:
@@ -478,31 +538,47 @@ class SniperGUI:
 
     def start_thread(self, time_slot):
         if self.is_running: return
+
+        target_date = self.date_var.get().strip()
+        current_token = self.token_var.get().strip()
+        student_id = self.student_id_var.get().strip()
+        student_name = self.student_name_var.get().strip()
+        if not current_token:
+            messagebox.showwarning("提示", "请先输入 Cookie/Token！")
+            return
+        if not student_id or not student_name:
+            messagebox.showwarning("提示", "请填写当前登录账号的学号/工号和姓名！")
+            return
+
         self.is_running = True
         self.stop_event.clear()
 
         # 锁定UI
         self.date_entry.config(state=tk.DISABLED)
         self.token_entry.config(state=tk.DISABLED)
+        self.student_id_entry.config(state=tk.DISABLED)
+        self.student_name_entry.config(state=tk.DISABLED)
         self.btn_auto_cookie.config(state=tk.DISABLED)
         self.btn_fetch.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         for child in self.btn_frame.winfo_children():
             child.config(state=tk.DISABLED)
 
-        t = threading.Thread(target=self.sniping_task, args=(time_slot,))
+        t = threading.Thread(
+            target=self.sniping_task,
+            args=(time_slot, target_date, current_token, student_id, student_name),
+        )
         t.daemon = True
         t.start()
 
-    def sniping_task(self, time_slot):
-        target_date = self.date_var.get().strip()
+    def sniping_task(self, time_slot, target_date, current_token, student_id, student_name):
         start_time, end_time = time_slot.split("-")
 
         payload = {
             "CDWID": "312801690c364d2cb56df744a39f38f1",
             "YYRQ": target_date,
             "KYYSJD": time_slot,
-            "BCXZRS": "0", "XQDM": "1", "YYRGH": "2510103005", "YYRXM": "胡嘉俊",
+            "BCXZRS": "0", "XQDM": "1", "YYRGH": student_id, "YYRXM": student_name,
             "YYLX": "2.0", "XMDM": "007", "CGDM": "004", "XQWID": "1",
             "YYKS": f"{target_date} {start_time}",
             "YYJS": f"{target_date} {end_time}",
@@ -510,8 +586,8 @@ class SniperGUI:
         }
 
         session = requests.Session()
-        session.headers.update(HEADERS)
-        self.safe_log(f"锁定时段：{target_date} {time_slot}")
+        session.headers.update({**HEADERS, "Cookie": current_token})
+        self.safe_log(f"锁定时段：{target_date} {time_slot}，预约人：{student_name}（{student_id}）")
 
         attempts = 0
         while not self.stop_event.is_set():
@@ -530,6 +606,17 @@ class SniperGUI:
                         break
                     else:
                         self.safe_log(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] #{attempts} -> {msg}")
+                        if "预约人学工号不是当前登录人" in msg:
+                            self.safe_log("身份不匹配，已停止预约。请重新点击“自动获取”，登录预约人本人的账号。")
+                            self.root.after(
+                                0,
+                                lambda: messagebox.showerror(
+                                    "登录身份不匹配",
+                                    "当前 Cookie 不属于填写的预约人。\n\n"
+                                    "请点击“自动获取”，在弹出的登录页中登录预约人本人的账号。",
+                                ),
+                            )
+                            break
                 except ValueError:
                     self.safe_log("请求被拦截：Cookie 可能失效")
                     break
@@ -545,6 +632,8 @@ class SniperGUI:
         def restore_ui():
             self.date_entry.config(state=tk.NORMAL)
             self.token_entry.config(state=tk.NORMAL)
+            self.student_id_entry.config(state=tk.NORMAL)
+            self.student_name_entry.config(state=tk.NORMAL)
             self.btn_auto_cookie.config(state=tk.NORMAL)
             self.btn_fetch.config(state=tk.NORMAL)
             self.btn_stop.config(state=tk.DISABLED)

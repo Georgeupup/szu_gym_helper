@@ -1,12 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+
+
+playwright_datas = collect_data_files('playwright')
+playwright_hiddenimports = collect_submodules('playwright')
+
 
 a = Analysis(
     ['szu_gym_helper.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=playwright_datas,
+    hiddenimports=playwright_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
